@@ -87,7 +87,8 @@
     (sysctl-name "kern.version"))
 
 {{RUNTIME_SERVICES}}
-; TCP egress uses the composition-owned ports; Unix sockets use write roots or exact connect grants.
+; TCP egress uses the composition-owned ports. Pathname sockets use write roots or exact connect
+; grants unless the network or IPC mode blocks them.
 (deny network*)
 
 ; Pathname sockets: bind, inbound, and outbound on write roots; outbound on each connect file.

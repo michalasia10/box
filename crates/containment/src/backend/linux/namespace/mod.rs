@@ -82,13 +82,25 @@ impl ContainmentBackend for NamespaceBackend {
                  host process visibility cannot be delivered",
             ));
         }
-        if config.ipc_mode() != IpcMode::SharedMemoryOnly {
+        match config.ipc_mode() {
+            IpcMode::SharedMemoryOnly => {}
+            IpcMode::Full => {
+                return Err(unenforceable(
+                    "IpcMode::Full: an IPC namespace separates SysV objects and POSIX \
+                     message queues unconditionally",
+                ));
+            }
+            IpcMode::Blocked => {
+                return Err(unenforceable(
+                    "IpcMode::Blocked is only implemented by the macOS Seatbelt backend",
+                ));
+            }
+        }
+        if matches!(config.network(), Network::LoopbackTcp4 { .. }) {
             return Err(unenforceable(
-                "IpcMode::Full: an IPC namespace separates SysV objects and POSIX \
-                 message queues unconditionally",
+                "Network::LoopbackTcp4 is only implemented by the macOS Seatbelt backend",
             ));
         }
-
         // `AllowAll` is the operator's `contain_egress = false` trust grant: this leaf joins the host
         // network namespace (see `enter_namespaces`) rather than a private, routeless one, so the
         // host's routes are already present and there is nothing to lower here. `Blocked` and
@@ -154,6 +166,16 @@ impl ContainmentBackend for NamespaceBackend {
         confirm_fd: Option<std::os::fd::RawFd>,
         _native_filesystem_handoff: Option<&std::os::unix::net::UnixStream>,
     ) -> Result<(), ContainmentError> {
+        if matches!(config.network(), Network::LoopbackTcp4 { .. }) {
+            return Err(unenforceable(
+                "Network::LoopbackTcp4 is only implemented by the macOS Seatbelt backend",
+            ));
+        }
+        if config.ipc_mode() == IpcMode::Blocked {
+            return Err(unenforceable(
+                "IpcMode::Blocked is only implemented by the macOS Seatbelt backend",
+            ));
+        }
         // Repeat live pathname validation at this backend's last safe point, per the
         // `ContainmentBackend` contract.
         config.require_live_path_identities()?;
@@ -214,6 +236,11 @@ impl ContainmentBackend for NamespaceBackend {
             // so the host's routes are already present: no loopback to bring up and no descriptor to
             // hand off. The mount view and the other namespaces below still apply.
             Network::AllowAll => {}
+            Network::LoopbackTcp4 { .. } => {
+                return Err(unenforceable(
+                    "Network::LoopbackTcp4 is unsupported by the Linux namespace backend",
+                ));
+            }
         };
 
         // The PID namespace must exist *before* the view is built, because mounting a fresh `/proc`

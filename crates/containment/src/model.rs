@@ -418,6 +418,13 @@ pub enum Network {
         /// Ports the workload may bind, each reachable from the box. Empty by default.
         listen: Vec<u16>,
     },
+    /// Outbound TCP to one destination on IPv4 loopback.
+    ///
+    /// This does not change pathname socket access controlled by [`IpcMode`].
+    LoopbackTcp4 {
+        /// The only reachable destination port.
+        port: u16,
+    },
 }
 
 impl Network {
@@ -478,6 +485,10 @@ pub enum IpcMode {
     /// Only shared memory IPC allowed.
     #[default]
     SharedMemoryOnly,
+    /// No named Mach services or pathname socket routes are granted.
+    ///
+    /// Process-local primitives are unchanged; this mode does not make a claim about them.
+    Blocked,
     /// Full IPC (shared memory + mach ports + etc).
     Full,
 }

@@ -764,35 +764,39 @@ fn require_absolute_home(home: &Path) -> Result<()> {
 }
 
 fn validate_network(network: &Network) -> Result<()> {
-    if let Network::Localhost { connect, listen } = network {
-        // Not `InvalidPort`: there is no port 0 here, the list is simply empty, and an
-        // "invalid port 0" diagnostic points an operator at the wrong defect.
-        if connect.is_empty() {
-            return Err(ContainmentError::ConflictingGrants {
-                reason:
-                    "Localhost names no port to connect to, so the workload would reach nothing"
-                        .to_string(),
-            });
-        }
-        for port in connect {
-            validate_port("connect", *port)?;
-        }
-        // Two grants naming one port is one grant, so the config would state a boundary the
-        // profile does not carry. Refused rather than folded, because the caller meant two
-        // services and got one.
-        for (index, port) in connect.iter().enumerate() {
-            if connect[..index].contains(port) {
+    match network {
+        Network::LoopbackTcp4 { port } => validate_port("connect", *port)?,
+        Network::Localhost { connect, listen } => {
+            // Not `InvalidPort`: there is no port 0 here, the list is simply empty, and an
+            // "invalid port 0" diagnostic points an operator at the wrong defect.
+            if connect.is_empty() {
                 return Err(ContainmentError::ConflictingGrants {
-                    reason: format!(
-                        "two of the composition's localhost ports are both {port}; two services \
-                         cannot share one port"
-                    ),
+                    reason:
+                        "Localhost names no port to connect to, so the workload would reach nothing"
+                            .to_string(),
                 });
             }
+            for port in connect {
+                validate_port("connect", *port)?;
+            }
+            // Two grants naming one port is one grant, so the config would state a boundary the
+            // profile does not carry. Refused rather than folded, because the caller meant two
+            // services and got one.
+            for (index, port) in connect.iter().enumerate() {
+                if connect[..index].contains(port) {
+                    return Err(ContainmentError::ConflictingGrants {
+                        reason: format!(
+                            "two of the composition's localhost ports are both {port}; two services \
+                         cannot share one port"
+                        ),
+                    });
+                }
+            }
+            for port in listen {
+                validate_port("listen", *port)?;
+            }
         }
-        for port in listen {
-            validate_port("listen", *port)?;
-        }
+        Network::Blocked | Network::AllowAll => {}
     }
     Ok(())
 }
@@ -1241,6 +1245,26 @@ mod tests {
         assert_invalid_port(Network::localhost().connect(0), "connect");
         assert_invalid_port(Network::localhost().connect(8080).connect(0), "connect");
         assert_invalid_port(Network::localhost().connect(8080).listen(0), "listen");
+        assert_invalid_port(Network::LoopbackTcp4 { port: 0 }, "connect");
+    }
+
+    #[test]
+    fn legacy_localhost_network_wire_form_is_unchanged() {
+        let config = ContainmentConfig::new()
+            .set_network(Network::localhost().connect(8080))
+            .expect("localhost port");
+        let json = config.to_json().expect("serialize config");
+        let wire: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            wire["network"],
+            serde_json::json!({"localhost": {"connect": [8080], "listen": []}})
+        );
+        assert_eq!(
+            ContainmentConfig::from_json(&json)
+                .expect("deserialize legacy form")
+                .network(),
+            &Network::localhost().connect(8080)
+        );
     }
 
     /// Two localhost services cannot share one port, so a config claiming they do is refused.

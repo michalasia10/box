@@ -178,7 +178,10 @@ fn group_by_path(config: &ContainmentConfig) -> Result<Vec<(&PathGrant, BTreeSet
 fn require_expressible(config: &ContainmentConfig) -> Result<()> {
     if config.signal_mode() != SignalMode::Isolated
         || config.process_info_mode() != ProcessInfoMode::Isolated
-        || config.ipc_mode() != IpcMode::SharedMemoryOnly
+        || !matches!(
+            config.ipc_mode(),
+            IpcMode::SharedMemoryOnly | IpcMode::Blocked
+        )
         || !matches!(config.backend_override(), BackendOverride::None)
     {
         return Err(unsupported(
@@ -186,13 +189,21 @@ fn require_expressible(config: &ContainmentConfig) -> Result<()> {
         ));
     }
     match config.network() {
-        // Localhost, with or without inbound ports, or AllowAll (operator-declared native egress,
-        // contain_egress = false).
+        // Blocked, one IPv4 loopback destination, Localhost (with or without inbound ports), or
+        // AllowAll (operator-declared native egress, contain_egress = false).
         Network::Localhost { .. } => {}
+        Network::LoopbackTcp4 { .. } => {}
         Network::AllowAll => {}
-        _ => {
+        Network::Blocked => {}
+    }
+    if matches!(config.network(), Network::Blocked) || config.ipc_mode() == IpcMode::Blocked {
+        if config
+            .authorizations()
+            .iter()
+            .any(|grant| grant.operation == Operation::Connect)
+        {
             return Err(unsupported(
-                "network access other than localhost ports or native (allow-all) egress",
+                "pathname socket grants with blocked network or IPC",
             ));
         }
     }
@@ -562,11 +573,15 @@ pub(crate) fn render_profile_with_streams(
                     write_leaf_allows("subpath", &path),
                     executable_carve_outs(config, granted)?
                 ));
-                cells.entry(CONNECT_FILE).or_default().push_str(&format!(
-                    "(allow network-bind (subpath \"{path}\"))\n\
-                     (allow network-inbound (subpath \"{path}\"))\n\
-                     (allow network-outbound (subpath \"{path}\"))\n"
-                ));
+                if !matches!(config.network(), Network::Blocked)
+                    && config.ipc_mode() != IpcMode::Blocked
+                {
+                    cells.entry(CONNECT_FILE).or_default().push_str(&format!(
+                        "(allow network-bind (subpath \"{path}\"))\n\
+                         (allow network-inbound (subpath \"{path}\"))\n\
+                         (allow network-outbound (subpath \"{path}\"))\n"
+                    ));
+                }
             }
             // No data rule, so a directory is not enumerable and a file's bytes stay unreadable.
             // The caller's spelling gets its own metadata rule when it differs, because a lookup
@@ -838,7 +853,8 @@ pub(crate) fn render_profile_with_streams(
              (allow system-socket (socket-domain AF_ROUTE))\n",
         );
     }
-    if !config.broad_exec() || config.runtime_services() {
+    if config.ipc_mode() != IpcMode::Blocked && (!config.broad_exec() || config.runtime_services())
+    {
         // Agents and opted-in leaves call `getpwuid` through this service. Keep the identity lookup
         // separate so an agent does not inherit the leaf-only sysctl and routing-socket grants.
         cells.entry(RUNTIME_SERVICES).or_default().push_str(
@@ -860,11 +876,20 @@ pub(crate) fn render_profile_with_streams(
                 ));
             }
         }
+        Network::LoopbackTcp4 { port } => {
+            cells.entry(CONNECT_PORTS).or_default().push_str(&format!(
+                "(allow network-outbound\n    (remote tcp4 \"localhost:{port}\"))\n"
+            ));
+        }
         // Native egress: any IP host and the system resolver, and no other pathname socket.
         Network::AllowAll => {
+            let resolver_route = if config.ipc_mode() == IpcMode::Blocked {
+                String::new()
+            } else {
+                format!("(allow network-outbound\n    (literal \"{SYSTEM_RESOLVER}\"))\n")
+            };
             cells.entry(CONNECT_PORTS).or_default().push_str(&format!(
-                "(allow network-outbound\n    (remote ip \"*:*\"))\n\
-                 (allow network-outbound\n    (literal \"{SYSTEM_RESOLVER}\"))\n"
+                "(allow network-outbound\n    (remote ip \"*:*\"))\n{resolver_route}"
             ));
         }
         Network::Blocked => {}
@@ -1168,6 +1193,94 @@ mod tests {
             !profile.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
             "a write root grants no read: {profile}"
         );
+    }
+
+    #[test]
+    fn explicit_ipv4_loopback_network_is_one_literal_port() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical");
+        let program = base.join("agent");
+        std::fs::write(&program, "agent").expect("program fixture");
+        let config = ContainmentConfig::new()
+            .set_network(Network::LoopbackTcp4 { port: 43123 })
+            .expect("one IPv4 loopback port")
+            .allow(&program, Operation::Exec, Scope::File)
+            .expect("exec grant");
+
+        let profile = render_profile(&config).expect("profile renders");
+        assert!(
+            profile.contains("(allow network-outbound\n    (remote tcp4 \"localhost:43123\"))")
+        );
+        assert!(!profile.contains("remote tcp \"localhost:"));
+    }
+
+    #[test]
+    fn blocked_network_and_ipc_do_not_restore_socket_or_mach_routes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical");
+        let program = base.join("agent");
+        let worktree = base.join("worktree");
+        let socket = base.join("local.sock");
+        std::fs::write(&program, "agent").expect("program fixture");
+        std::fs::create_dir(&worktree).expect("write root fixture");
+        std::fs::write(&socket, "socket path fixture").expect("connect path fixture");
+
+        let blocked_network = ContainmentConfig::new()
+            .allow(&program, Operation::Exec, Scope::File)
+            .expect("exec grant")
+            .allow(&worktree, Operation::Write, Scope::Root)
+            .expect("write root");
+        let blocked_profile =
+            render_profile(&blocked_network).expect("offline network profile renders");
+        assert!(!blocked_profile.contains("(allow network-bind"));
+        assert!(!blocked_profile.contains("(allow network-inbound"));
+        assert!(!blocked_profile.contains("(allow network-outbound"));
+        assert!(!blocked_profile.contains(&format!("(path \"{}\")", socket.display())));
+
+        let blocked_ipc = blocked_network
+            .clone()
+            .set_network(Network::LoopbackTcp4 { port: 43123 })
+            .expect("loopback port")
+            .set_ipc_mode(IpcMode::Blocked);
+        let profile = render_profile(&blocked_ipc).expect("blocked IPC profile renders");
+        assert!(profile.contains("remote tcp4 \"localhost:43123\""));
+        assert!(!profile.contains("(allow mach-lookup"));
+        assert!(!profile.contains(&format!("(literal \"{SYSTEM_RESOLVER}\")")));
+        assert!(!profile.contains(&format!(
+            "(allow network-outbound\n    (subpath \"{}\"))",
+            worktree.display()
+        )));
+        assert!(!profile.contains(&format!(
+            "(allow network-bind (subpath \"{}\"))",
+            worktree.display()
+        )));
+
+        let blocked_ipc_allow_all = blocked_ipc
+            .clone()
+            .set_network(Network::AllowAll)
+            .expect("allow-all egress");
+        let allow_all_profile =
+            render_profile(&blocked_ipc_allow_all).expect("allow-all profile renders");
+        assert!(allow_all_profile.contains("(remote ip \"*:*\")"));
+        assert!(!allow_all_profile.contains(&format!("(literal \"{SYSTEM_RESOLVER}\")")));
+        assert!(!allow_all_profile.contains("(allow mach-lookup"));
+
+        let explicit_socket = blocked_ipc
+            .clone()
+            .allow(&socket, Operation::Connect, Scope::File)
+            .expect("connect path grant");
+        assert!(matches!(
+            render_profile(&explicit_socket),
+            Err(ContainmentError::UnsupportedCapability { .. })
+        ));
+
+        let blocked_network_socket = blocked_network
+            .allow(&socket, Operation::Connect, Scope::File)
+            .expect("connect path grant");
+        assert!(matches!(
+            render_profile(&blocked_network_socket),
+            Err(ContainmentError::UnsupportedCapability { .. })
+        ));
     }
 
     /// A program outside a write root, with the one proxy port every expressible profile carries.
